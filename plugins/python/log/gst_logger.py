@@ -16,7 +16,7 @@
 # Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
 # Boston, MA 02110-1301, USA.
 
-import inspect
+import inspect, sys, traceback
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -37,6 +37,10 @@ class GstLogger(Logger):
 
         # Format the message with caller info
         log_message = f"{filename}:{lineno} - {message % args if args else message}"
+
+        if sys.exc_info()[0]:
+            log_message += "\n"
+            log_message += traceback.format_exc()
 
         # Call the correct GStreamer logging function
         log_func(log_message)
