@@ -40,7 +40,7 @@ class LLM(BaseLlm):
 
 
 if CAN_REGISTER_ELEMENT:
-    GObject.type_register(LLM)
+    GObject.type_register(LLM, "pyml_llm")
     __gstelementfactory__ = ("pyml_llm", Gst.Rank.NONE, LLM)
 else:
     GlobalLogger().warning(

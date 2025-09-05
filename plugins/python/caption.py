@@ -25,8 +25,8 @@ try:
 
     gi.require_version("Gst", "1.0")
     gi.require_version("GstBase", "1.0")
-    gi.require_version("GstVideo", "1.0")
     gi.require_version("GLib", "2.0")
+    gi.require_version("GObject", "2.0")
     gi.require_version("GstAnalytics", "1.0")
 
     from gi.repository import Gst, GObject, GstAnalytics, GLib, GstBase  # noqa: E402
@@ -223,6 +223,23 @@ class Caption(VideoTransform):
         if self.engine_helper.engine:
             self.engine_helper.engine.prompt = value
 
+    @GObject.Property(type=str)
+    def system_prompt(self):
+        "A custom system prompt to pass to the LLM"
+        return self.sys_prompt
+
+    @system_prompt.setter
+    def system_prompt(self, value):
+        self.sys_prompt = value
+
+    def __init__(self):
+        super().__init__()
+        self.model_name = "microsoft/Phi-3.5-vision-instruct"
+        self.caption = "   "
+        self.text_src_pad = None
+        self.__prompt = "What is shown in this image?"
+        self.sys_prompt = None
+
     def do_request_new_pad(self, template, name, caps):
         if self.text_src_pad:
             self.logger.error("Element already has a text_src")
@@ -242,7 +259,7 @@ class Caption(VideoTransform):
         pad.set_active(False)
         self.text_src_pad = None
 
-    def push_text_buffer(self, text, buf_pts, buf_duration):
+    def push_text_buffer(self, text, buf_pts, buf_dts, buf_duration):
         """
         Pushes a text buffer to the `text_src` pad with proper timestamps.
 
@@ -256,7 +273,8 @@ class Caption(VideoTransform):
         # Set the text buffer timestamps
         text_buffer.pts = buf_pts
         text_buffer.dts = buf_pts  # DTS is usually the same as PTS for text buffers
-        text_buffer.duration = buf_duration
+        # Put a long duration so the subtitles are visible
+        text_buffer.duration = 60 * Gst.SECOND
 
         # Push the buffer
         ret = self.text_src_pad.push(text_buffer)

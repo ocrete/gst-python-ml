@@ -22,8 +22,9 @@ import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstBase", "1.0")
 gi.require_version("GLib", "2.0")
+gi.require_version("GObject", "2.0")
 
-from gi.repository import Gst  # noqa: E402
+from gi.repository import Gst, GObject  # noqa: E402
 
 from base_aggregator import BaseAggregator
 
@@ -49,8 +50,19 @@ class BaseLlm(BaseAggregator):
         ),
     )
 
+    @GObject.Property(type=str)
+    def system_prompt(self):
+        "A custom system prompt to pass to the LLM"
+        return self.sys_prompt
+
+    @system_prompt.setter
+    def system_prompt(self, value):
+        self.sys_prompt = value
+
     def __init__(self):
         super().__init__()
+        self.engine = None  # Explicitly initialize self.engine
+        self.sys_prompt = None
 
     def do_process(self, buf):
         """
@@ -96,21 +108,19 @@ class BaseLlm(BaseAggregator):
                     return Gst.FlowReturn.ERROR
 
             # Generate text using the engine
-            generated_text = self.engine_helper.engine.generate(input_text)
+            generated_text = self.engine_helper.engine.generate(input_text, system_prompt=self.sys_prompt)
             self.logger.info(f"Generated text: {generated_text}")
 
             buf.unmap(map_info)
 
             # Push the generated text downstream
-            self.push_generated_text(generated_text)
-
-            return Gst.FlowReturn.OK
+            return self.push_generated_text(buf, generated_text)
 
         except Exception as e:
             self.logger.error(f"Error in LLM processing: {e}")
             return Gst.FlowReturn.ERROR
 
-    def push_generated_text(self, generated_text):
+    def push_generated_text(self, inbuf, generated_text):
         """
         Push the generated text downstream.
         """
@@ -124,10 +134,14 @@ class BaseLlm(BaseAggregator):
 
             map_info_out.data[: len(generated_bytes)] = generated_bytes
             outbuf.unmap(map_info_out)
+            outbuf.pts = inbuf.pts
+            outbuf.dts = inbuf.dts
+            outbuf.duration = inbuf.duration
 
             # Push the buffer downstream
-            self.srcpad.push(outbuf)
+            ret = self.srcpad.push(outbuf)
             self.logger.info("Pushed generated text downstream")
+            return ret
 
         except Exception as e:
             self.logger.error(f"Error pushing generated text: {e}")

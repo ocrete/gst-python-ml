@@ -28,8 +28,10 @@ from transformers import (
     AutoImageProcessor,
     VisionEncoderDecoderModel,
     BitsAndBytesConfig,
+    Qwen2_5_VLForConditionalGeneration,
 )
 from faster_whisper import WhisperModel
+from qwen_vl_utils import process_vision_info
 
 from .ml_engine import MLEngine
 
@@ -41,7 +43,37 @@ class PyTorchEngine(MLEngine):
         tokenizer_name = kwargs.get("tokenizer_name")
 
         try:
-            if os.path.isfile(model_name):
+            # Special case for Phi-3-vision model from Hugging Face
+            if "Phi-3.5-vision" in model_name or "Qwen2.5-VL" in model_name:
+                if "Phi" in model_name:
+                    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        device_map="auto",
+                        quantization_config = quantization_config,
+                        torch_dtype="auto",
+                        trust_remote_code=True,
+                        _attn_implementation="flash_attention_2",
+                    )
+                    self.processor = AutoProcessor.from_pretrained(
+                        model_name, trust_remote_code=True, num_crops=16
+                    )
+                    print(self.model)
+                else:
+                    self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                            model_name,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto"
+                    )
+                    self.processor = AutoProcessor.from_pretrained(model_name)
+                #self.model = torch.compile(self.model, backend="inductor", mode="max-autotune", fullgraph=False)
+
+                self.logger.info(
+                    model_name + " model and processor loaded successfully."
+                )
+                self.vision_language_model = True
+                self.model.eval()
+            elif os.path.isfile(model_name):
                 self.model = torch.load(model_name)
                 self.logger.info(f"Model loaded from local path: {model_name}")
             else:
@@ -194,14 +226,95 @@ class PyTorchEngine(MLEngine):
             results.squeeze(0) if not is_batch else results
         )  # Squeeze batch dim if single
 
-    def forward(self, frames):
+    def forward(self, frames, system_prompt=None):
         """Handle inference for different types of models, supporting single frames or batches."""
         is_batch = isinstance(frames, np.ndarray) and frames.ndim == 4  # (B, H, W, C)
         if not isinstance(frames, (np.ndarray, str)):
             self.logger.error(f"Invalid input type for forward: {type(frames)}")
             return None
 
-        if self.image_processor and self.tokenizer:
+        if self.vision_language_model and self.processor:
+            try:
+                from PIL import Image
+                import torch
+                import gc
+
+                # Convert frames to PIL images
+                if is_batch:
+                    images = [Image.fromarray(np.uint8(frame)) for frame in frames]
+                else:
+                    images = [Image.fromarray(np.uint8(frames))]
+
+                # Create prompt with placeholders for all images
+                prompt_content = (
+                    "\n".join([f"<|image_{i+1}|>" for i in range(len(images))])
+                    + f"\n{self.prompt}"
+                )
+                messages = []
+
+                if system_prompt:
+                    messages += [{"role": "system", "content": {"text": system_prompt}}]
+
+                for image in images:
+                    prompt_content = [{"type":"text", "text": self.prompt}]
+                    prompt_content += [{"type": "image", "image": image}]
+                    messages += [{"role": "user", "content": prompt_content}]
+                prompt = self.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                images, videos = process_vision_info(messages)
+
+                # Process inputs for batch inference
+                inputs = self.processor(text=prompt, images=images, return_tensors="pt").to(
+                    self.device
+                )
+
+                # Run inference
+                generation_args = {
+                    "max_new_tokens": 100,
+                    "temperature": 0.0,
+                    "do_sample": False,
+                }
+                with torch.inference_mode():
+                    generate_ids = self.model.generate(
+                        **inputs,
+                        eos_token_id=self.processor.tokenizer.eos_token_id,
+                        **generation_args,
+                    )
+
+                # Decode response
+                generate_ids = generate_ids[:, inputs["input_ids"].shape[1] :]
+                response = self.processor.batch_decode(
+                    generate_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0]
+
+                # Split response into per-frame captions (adjust based on model output)
+                if is_batch:
+                    # Assume response contains captions separated by newlines or repeated
+                    captions = (
+                        response.split("\n")[: len(images)]
+                        if "\n" in response
+                        else [response] * len(images)
+                    )
+                else:
+                    captions = [response]
+
+                self.logger.info(f"Generated captions: {captions}")
+
+                # Clean up
+                del inputs, generate_ids
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                return captions if is_batch else captions[0]
+
+            except Exception as e:
+                self.logger.error(f"Vision-language inference error: {e}")
+                return None
+
+        elif self.image_processor and self.tokenizer:
             if is_batch:
                 self.logger.error(
                     "Batch processing not supported for vision-text models with frame buffering."
@@ -293,10 +406,28 @@ class PyTorchEngine(MLEngine):
         else:
             raise ValueError("Unsupported model type or missing processor/tokenizer.")
 
-    def generate(self, input_text, max_length=100):
+    def generate(self, input_text, max_length=1000, system_prompt=None):
+        messages = [
+                {"role": "user", "content": input_text}
+        ]
+        if system_prompt:
+            messages += {"role": "system", "content": system_prompt},
+        input_text = self.tokenizer.apply_chat_template(
+          messages,
+          tokenize=False,
+          add_generation_prompt=True,
+          enable_thinking=False # Switches between thinking and non-thinking modes. Default is True.
+          )
+
         inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
         outputs = self.model.generate(**inputs, max_length=max_length)
-        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        outputs = outputs[0][len(inputs.input_ids[0]):].tolist()
+        try:
+            # rindex finding 151668 (</think>)
+            index = len(outputs) - outputs[::-1].index(151668)
+        except ValueError:
+            index = 0
+        generated_text = self.tokenizer.decode(outputs[index:], skip_special_tokens=True)
         self.logger.info(f"Generated text: {generated_text}")
         return generated_text
 
